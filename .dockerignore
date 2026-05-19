@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.vscode
+.golangci.yml
+Makefile
+README*
+LICENSE
+**/*_test.go
+test/
+metabase-mcp
+dist/

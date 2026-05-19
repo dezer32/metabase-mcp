@@ -1,0 +1,67 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - unused
+    - misspell
+  settings:
+    govet:
+      # enable-all включает fieldalignment, который ради экономии 8 байт
+      # ломает читаемость JSON-DTO (поля должны быть в логическом порядке,
+      # а не в порядке убывания размера). Перечислим явный whitelist.
+      enable:
+        - asmdecl
+        - assign
+        - atomic
+        - bools
+        - buildtag
+        - cgocall
+        - composites
+        - copylocks
+        - directive
+        - errorsas
+        - framepointer
+        - httpresponse
+        - ifaceassert
+        - loopclosure
+        - lostcancel
+        - nilfunc
+        - printf
+        - shift
+        - sigchanyzer
+        - slog
+        - stdmethods
+        - stringintconv
+        - structtag
+        - tests
+        - timeformat
+        - unmarshal
+        - unreachable
+        - unsafeptr
+        - unusedresult
+    errcheck:
+      check-type-assertions: true
+      # defer resp.Body.Close() — общепринятая идиома Go, ошибки в Close
+      # тела ответа уже не интересуют (если был read — Close не упадёт).
+      exclude-functions:
+        - (io.Closer).Close
+        - (*net/http.Response).Body
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
