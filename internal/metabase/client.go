@@ -9,26 +9,36 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/dezer32/metabase-mcp/internal/metabase/oauth"
 )
 
-// Client — HTTP-клиент к Metabase. Знает про сессию и 401-retry.
+// Client — HTTP-клиент к Metabase. Знает про аутентификацию (session или
+// oauth) и 401-retry.
 type Client struct {
 	baseURL string
-	session *sessionManager
+	auth    authProvider
 	http    *http.Client
 	log     *slog.Logger
 }
 
-// NewClient собирает клиент с дефолтными параметрами:
-// HTTP-timeout, 3 backoff-попытки логина (500ms/1s/2s), neg-cache 30s.
+// newClient — общий конструктор: связывает baseURL, провайдер аутентификации,
+// HTTP-клиент и логгер.
+func newClient(baseURL string, auth authProvider, hc *http.Client, log *slog.Logger) *Client {
+	return &Client{baseURL: baseURL, auth: auth, http: hc, log: log}
+}
+
+// NewClient собирает password-клиент: HTTP-timeout, 4 backoff-попытки логина
+// (0/500ms/1s/2s), neg-cache 30s.
 func NewClient(baseURL, user, password string, httpTimeout time.Duration, log *slog.Logger) *Client {
 	hc := &http.Client{Timeout: httpTimeout}
-	return &Client{
-		baseURL: baseURL,
-		session: newSessionManager(baseURL, user, password, hc, defaultBackoffs()),
-		http:    hc,
-		log:     log,
-	}
+	return newClient(baseURL, newSessionManager(baseURL, user, password, hc, defaultBackoffs()), hc, log)
+}
+
+// NewOAuthClient собирает oauth-клиент поверх готового oauth.Manager.
+// hc — тот же bounded HTTP-клиент, что используется для token-операций.
+func NewOAuthClient(baseURL string, mgr *oauth.Manager, hc *http.Client, log *slog.Logger) *Client {
+	return newClient(baseURL, &oauthProvider{mgr: mgr}, hc, log)
 }
 
 // doJSON — основной метод запроса к Metabase.
@@ -36,28 +46,34 @@ func NewClient(baseURL, user, password string, httpTimeout time.Duration, log *s
 // method: GET/POST.
 // body: будет сериализован в JSON, или nil.
 // out: указатель на структуру для декодирования, или nil если не интересует.
-// Логика 401: если получили 401 — инвалидируем сессию, пробуем ещё один раз.
-// Если снова 401 — возвращаем ошибку наружу.
+//
+// Логика 401 (см. classify401): истёкший токен/сессия (invalid_token или нет
+// заголовка) → invalidate + ровно один ретрай; при ошибке инвалидизации —
+// возвращаем её (не ретраим со старым credential). insufficient_scope/audience
+// → диагностическая ошибка без рефреша.
 func (c *Client) doJSON(ctx context.Context, method, path string, body, out any) error {
 	for attempt := 0; ; attempt++ {
-		sessID, err := c.session.ensureSession(ctx)
-		if err != nil {
-			return fmt.Errorf("session: %w", err)
-		}
-
-		status, raw, err := c.roundTrip(ctx, method, path, sessID, body)
+		status, raw, header, cred, err := c.roundTrip(ctx, method, path, body)
 		if err != nil {
 			return err
 		}
 		if status == http.StatusUnauthorized {
-			// Сессия истекла на стороне Metabase. Сбрасываем и пробуем ещё раз.
-			c.session.invalidate(sessID)
-			if attempt == 0 {
-				c.log.Debug("metabase: 401, retrying with fresh session",
+			retryable, diag := classify401(header)
+			if attempt == 0 && retryable {
+				if ierr := c.auth.invalidate(ctx, cred); ierr != nil {
+					return fmt.Errorf("metabase: %s %s — 401 and credential refresh failed: %w",
+						method, path, ierr)
+				}
+				c.log.Debug("metabase: 401, retrying with refreshed credential",
 					slog.String("path", path))
 				continue
 			}
-			return fmt.Errorf("metabase: %s %s — repeated 401 after relogin", method, path)
+			if !retryable {
+				return fmt.Errorf("metabase: %s %s — 401 not retryable (%s); body=%s",
+					method, path, diag, truncate(string(raw), 300))
+			}
+			return fmt.Errorf("metabase: %s %s — repeated 401 after credential refresh; body=%s",
+				method, path, truncate(string(raw), 300))
 		}
 		if status < 200 || status >= 300 {
 			return fmt.Errorf("metabase: %s %s — status=%d body=%s",
@@ -72,35 +88,40 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 	}
 }
 
-// roundTrip — собирает запрос с X-Metabase-Session и делает один HTTP-вызов.
-// Возвращает (status, body, err). err только на сетевых/протокольных проблемах.
-func (c *Client) roundTrip(ctx context.Context, method, path, sessID string, body any) (int, []byte, error) {
+// roundTrip собирает запрос, ставит auth-заголовок через провайдера и делает
+// один HTTP-вызов. Возвращает (status, body, headers, cred, err); cred —
+// generation credential'а, использованного для этого запроса (для invalidate).
+func (c *Client) roundTrip(ctx context.Context, method, path string, body any) (int, []byte, http.Header, uint64, error) {
 	var reqBody io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
 		if err != nil {
-			return 0, nil, fmt.Errorf("encode body: %w", err)
+			return 0, nil, nil, 0, fmt.Errorf("encode body: %w", err)
 		}
 		reqBody = bytes.NewReader(buf)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
 	if err != nil {
-		return 0, nil, fmt.Errorf("build req: %w", err)
+		return 0, nil, nil, 0, fmt.Errorf("build req: %w", err)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("X-Metabase-Session", sessID)
 	req.Header.Set("Accept", "application/json")
+
+	cred, err := c.auth.apply(ctx, req)
+	if err != nil {
+		return 0, nil, nil, 0, err
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("transport: %w", err)
+		return 0, nil, nil, 0, fmt.Errorf("transport: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, nil, fmt.Errorf("read body: %w", err)
+		return 0, nil, nil, 0, fmt.Errorf("read body: %w", err)
 	}
-	return resp.StatusCode, raw, nil
+	return resp.StatusCode, raw, resp.Header, cred, nil
 }

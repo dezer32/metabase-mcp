@@ -146,12 +146,21 @@ func TestSession_TransientErrorRetried(t *testing.T) {
 	}
 }
 
+// newReq — throwaway-запрос для вызова apply в тестах.
+func newReq(t *testing.T) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "http://example/api/database", nil)
+	if err != nil {
+		t.Fatalf("new req: %v", err)
+	}
+	return req
+}
+
 // TestSession_ConcurrentInvalidateRace — ключевой тест из плана.
-// 50 goroutines одновременно держат старую сессию sess-X.
-// Fake возвращает 401 на любой запрос с sess-X, 200 после re-login.
-// Ожидание: ровно 2 логина (initial + один re-login), не 51.
-// Если invalidate() будет безусловным, увидим много логинов: каждая горутина
-// со старой сессией будет сбрасывать чью-то новую и провоцировать ещё один.
+// 50 goroutines одновременно держат снимок generation первой сессии и зовут
+// invalidate(gen)+apply. Ожидание: ровно 2 логина (initial + один re-login).
+// Если invalidate() была бы безусловной, каждая горутина со старым gen
+// сбрасывала бы чью-то новую сессию и провоцировала ещё один логин.
 func TestSession_ConcurrentInvalidateRace(t *testing.T) {
 	lc := &loginCounter{}
 	srv := httptest.NewServer(lc.handler())
@@ -159,8 +168,8 @@ func TestSession_ConcurrentInvalidateRace(t *testing.T) {
 
 	sm := newSessionManager(srv.URL, "u", "p", srv.Client(), zeroBackoff())
 
-	// Шаг 1: получить первую сессию.
-	first, err := sm.ensureSession(context.Background())
+	// Шаг 1: получить первую сессию и её generation.
+	gen0, err := sm.apply(context.Background(), newReq(t))
 	if err != nil {
 		t.Fatalf("initial login: %v", err)
 	}
@@ -172,21 +181,14 @@ func TestSession_ConcurrentInvalidateRace(t *testing.T) {
 	var wg sync.WaitGroup
 	var invalidates atomic.Int32
 
-	// Все горутины вызывают invalidate(first) — как будто получили 401
-	// с использованием старой сессии. Потом сразу ensureSession.
 	wg.Add(N)
 	for i := 0; i < N; i++ {
 		go func() {
 			defer wg.Done()
-			sm.invalidate(first)
+			_ = sm.invalidate(context.Background(), gen0)
 			invalidates.Add(1)
-			id, err := sm.ensureSession(context.Background())
-			if err != nil {
-				t.Errorf("ensureSession in goroutine: %v", err)
-				return
-			}
-			if id == "" {
-				t.Errorf("empty id")
+			if _, err := sm.apply(context.Background(), newReq(t)); err != nil {
+				t.Errorf("apply in goroutine: %v", err)
 			}
 		}()
 	}
@@ -206,18 +208,20 @@ func TestSession_InvalidateOnlyOnMatch(t *testing.T) {
 
 	sm := newSessionManager(srv.URL, "u", "p", srv.Client(), zeroBackoff())
 
-	id1, err := sm.ensureSession(context.Background())
+	gen1, err := sm.apply(context.Background(), newReq(t))
 	if err != nil {
 		t.Fatalf("login: %v", err)
 	}
-	// Инвалидируем «чужую» сессию. Текущая не должна слететь.
-	sm.invalidate("some-old-id-we-never-had")
-	id2, err := sm.ensureSession(context.Background())
+	// Инвалидируем «чужой» generation. Текущая сессия не должна слететь.
+	if err := sm.invalidate(context.Background(), gen1+999); err != nil {
+		t.Fatalf("invalidate: %v", err)
+	}
+	gen2, err := sm.apply(context.Background(), newReq(t))
 	if err != nil {
 		t.Fatalf("login 2: %v", err)
 	}
-	if id1 != id2 {
-		t.Fatalf("session should not be invalidated when ID does not match")
+	if gen1 != gen2 {
+		t.Fatalf("session should not be invalidated when generation does not match")
 	}
 	if got := lc.Calls(); got != 1 {
 		t.Fatalf("expected 1 call, got %d", got)

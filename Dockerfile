@@ -21,5 +21,10 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/metabase-mcp /metabase-mcp
 
 # Слой stdio — никаких портов, всё через stdin/stdout.
+#
+# OAuth-режим: интерактивный вход (браузер + loopback-колбэк) внутри контейнера
+# не работает (127.0.0.1 в контейнере ≠ хост, браузера нет). Логиньтесь на хосте
+# и монтируйте token.json на ЗАПИСЬ (нужно для ротации refresh) либо ставьте
+# METABASE_OAUTH_NONINTERACTIVE=true. Подробности — в README.
 USER nonroot:nonroot
 ENTRYPOINT ["/metabase-mcp"]

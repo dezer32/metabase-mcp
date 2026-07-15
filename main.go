@@ -39,6 +39,7 @@ func run() error {
 
 	log.Info("metabase-mcp boot",
 		slog.String("metabase_url", cfg.MetabaseURL),
+		slog.String("auth_mode", cfg.AuthMode),
 		slog.String("log_level", cfg.LogLevel),
 		slog.Duration("http_timeout", cfg.HTTPTimeout),
 		slog.String("transport", *transport),
@@ -48,7 +49,12 @@ func run() error {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	srv := server.New(cfg, log)
+	// В oauth-режиме здесь может произойти интерактивный вход при первом старте
+	// (ссылка в stderr + браузер). Дальнейшие старты — неинтерактивный refresh.
+	srv, err := server.New(ctx, cfg, log)
+	if err != nil {
+		return fmt.Errorf("server: %w", err)
+	}
 	if err := server.Run(ctx, srv, *transport, log); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}

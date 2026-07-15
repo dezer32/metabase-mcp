@@ -12,6 +12,9 @@ import (
 	"time"
 )
 
+// Проверка на этапе компиляции: sessionManager реализует authProvider.
+var _ authProvider = (*sessionManager)(nil)
+
 // ErrAuth — кред неправильный. Возвращается из ensureSession при 401/400.
 // Помечает «known bad», на короткое время не пытаемся снова логиниться,
 // чтобы не словить rate-limit Metabase.
@@ -37,12 +40,16 @@ type sessionManager struct {
 	http     *http.Client
 	backoffs []time.Duration
 
-	// mu защищает cached и negCacheUntil. Удерживается на время doLogin,
+	// mu защищает cached, gen и negCacheUntil. Удерживается на время doLogin,
 	// чтобы исключить «гонку логинов»: 50 параллельных вызовов
 	// ensureSession при пустом кэше выполнят один doLogin, остальные
 	// получат результат из double-check.
-	mu            sync.Mutex
-	cached        string
+	mu     sync.Mutex
+	cached string
+	// gen — версия текущей cached-сессии. Инкрементится при каждом новом
+	// успешном логине. apply отдаёт (id, gen) одним снимком, invalidate(gen)
+	// сбрасывает сессию ТОЛЬКО если gen ещё актуален.
+	gen           uint64
 	negCacheUntil time.Time
 	negCacheTTL   time.Duration
 }
@@ -59,20 +66,38 @@ func newSessionManager(baseURL, user, password string, hc *http.Client, backoffs
 	}
 }
 
-// ensureSession возвращает действующий session-id.
-// Если в кэше пусто — логинится с backoff. На 401/400 — фиксирует
-// known-bad и в течение negCacheTTL не пытается снова.
+// apply ставит X-Metabase-Session и возвращает generation текущей сессии.
+// Снимок (id, gen) берётся атомарно под одним мьютексом — иначе «протухший
+// 401» со старой сессией мог бы форс-инвалидировать уже обновлённую.
+func (s *sessionManager) apply(ctx context.Context, req *http.Request) (uint64, error) {
+	s.mu.Lock()
+	id, gen, err := s.ensureSessionLocked(ctx)
+	s.mu.Unlock()
+	if err != nil {
+		return 0, fmt.Errorf("session: %w", err)
+	}
+	req.Header.Set("X-Metabase-Session", id)
+	return gen, nil
+}
+
+// ensureSession возвращает действующий session-id (совместимость с тестами).
 func (s *sessionManager) ensureSession(ctx context.Context) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	id, _, err := s.ensureSessionLocked(ctx)
+	return id, err
+}
 
-	// Double-check после захвата лока: возможно, пока мы ждали Lock,
-	// соседняя горутина уже залогинилась.
+// ensureSessionLocked — ядро логина. ВЫЗЫВАЕТСЯ ПОД УДЕРЖАНИЕМ mu.
+// Если в кэше пусто — логинится с backoff. На 401/400 — фиксирует known-bad
+// и в течение negCacheTTL не пытается снова. Успешный логин инкрементит gen.
+func (s *sessionManager) ensureSessionLocked(ctx context.Context) (string, uint64, error) {
+	// Double-check: возможно, пока мы ждали Lock, соседняя горутина уже залогинилась.
 	if s.cached != "" {
-		return s.cached, nil
+		return s.cached, s.gen, nil
 	}
 	if time.Now().Before(s.negCacheUntil) {
-		return "", ErrAuth
+		return "", s.gen, ErrAuth
 	}
 
 	var lastErr error
@@ -82,37 +107,39 @@ func (s *sessionManager) ensureSession(ctx context.Context) (string, error) {
 			select {
 			case <-ctx.Done():
 				t.Stop()
-				return "", ctx.Err()
+				return "", s.gen, ctx.Err()
 			case <-t.C:
 			}
 		}
 		id, err := s.doLogin(ctx)
 		if err == nil {
 			s.cached = id
-			return id, nil
+			s.gen++
+			return id, s.gen, nil
 		}
 		if errors.Is(err, ErrAuth) {
 			s.negCacheUntil = time.Now().Add(s.negCacheTTL)
-			return "", err
+			return "", s.gen, err
 		}
 		lastErr = err
 	}
 	if lastErr == nil {
 		lastErr = errors.New("metabase: login failed without specific error")
 	}
-	return "", lastErr
+	return "", s.gen, lastErr
 }
 
-// invalidate сбрасывает кэшированную сессию ТОЛЬКО если она совпадает с
-// переданной. Это критично для race-safety: если параллельная горутина уже
-// успела перелогиниться и положила в кэш свежую сессию, наш просроченный
-// 401 не должен её сбрасывать.
-func (s *sessionManager) invalidate(usedID string) {
+// invalidate сбрасывает кэшированную сессию ТОЛЬКО если её generation совпадает
+// с переданным. Это критично для race-safety: если параллельная горутина уже
+// перелогинилась (gen вырос), наш просроченный 401 не должен её сбрасывать.
+// Инвалидизация локальная (без сети), поэтому всегда возвращает nil.
+func (s *sessionManager) invalidate(_ context.Context, gen uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cached == usedID {
+	if s.gen == gen && s.cached != "" {
 		s.cached = ""
 	}
+	return nil
 }
 
 // doLogin делает POST /api/session. Возвращает ErrAuth на 401/400,

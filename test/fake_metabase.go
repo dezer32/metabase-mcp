@@ -9,17 +9,24 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
 
-// FakeMetabase — минимальный fake-сервер Metabase API.
-// Отдаёт: POST /api/session, GET /api/database, GET /api/database/:id/metadata,
-// POST /api/dataset.
+// FakeMetabase — минимальный fake-сервер Metabase API + OAuth authorization
+// server. Отдаёт: POST /api/session, GET /api/database,
+// GET /api/database/:id/metadata, POST /api/dataset, а также well-known
+// discovery, /oauth/register, /oauth/authorize, /oauth/token. Data-эндпоинты
+// принимают ЛИБО X-Metabase-Session (session-режим), ЛИБО Authorization: Bearer
+// (oauth-режим).
 type FakeMetabase struct {
 	srv          *httptest.Server
 	loginCalls   atomic.Int32
 	sessionToken atomic.Value // string
+
+	tokenCalls   atomic.Int32
+	issuedAccess atomic.Value // string — последний выданный Bearer
 
 	mu           sync.Mutex
 	databases    []map[string]any
@@ -73,6 +80,12 @@ func NewFakeMetabase() *FakeMetabase {
 	mux.HandleFunc("GET /api/database", f.handleDatabases)
 	mux.HandleFunc("GET /api/database/{id}/metadata", f.handleMetadata)
 	mux.HandleFunc("POST /api/dataset", f.handleDataset)
+	// OAuth authorization server + protected resource.
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", f.handlePRM)
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", f.handleASMeta)
+	mux.HandleFunc("POST /oauth/register", f.handleOAuthRegister)
+	mux.HandleFunc("GET /oauth/authorize", f.handleOAuthAuthorize)
+	mux.HandleFunc("POST /oauth/token", f.handleOAuthToken)
 	f.srv = httptest.NewServer(mux)
 	return f
 }
@@ -92,7 +105,7 @@ func (f *FakeMetabase) handleLogin(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (f *FakeMetabase) handleDatabases(w http.ResponseWriter, r *http.Request) {
-	if !f.checkSession(w, r) {
+	if !f.checkAuth(w, r) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -100,7 +113,7 @@ func (f *FakeMetabase) handleDatabases(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *FakeMetabase) handleMetadata(w http.ResponseWriter, r *http.Request) {
-	if !f.checkSession(w, r) {
+	if !f.checkAuth(w, r) {
 		return
 	}
 	dbID, err := strconv.Atoi(r.PathValue("id"))
@@ -120,7 +133,7 @@ func (f *FakeMetabase) handleMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *FakeMetabase) handleDataset(w http.ResponseWriter, r *http.Request) {
-	if !f.checkSession(w, r) {
+	if !f.checkAuth(w, r) {
 		return
 	}
 	f.mu.Lock()
@@ -130,7 +143,19 @@ func (f *FakeMetabase) handleDataset(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func (f *FakeMetabase) checkSession(w http.ResponseWriter, r *http.Request) bool {
+// checkAuth принимает ЛИБО валидный X-Metabase-Session, ЛИБО Authorization:
+// Bearer с последним выданным access-токеном.
+func (f *FakeMetabase) checkAuth(w http.ResponseWriter, r *http.Request) bool {
+	if authz := r.Header.Get("Authorization"); strings.HasPrefix(authz, "Bearer ") {
+		tok := strings.TrimPrefix(authz, "Bearer ")
+		cur, _ := f.issuedAccess.Load().(string)
+		if tok != "" && tok == cur {
+			return true
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		return false
+	}
 	got := r.Header.Get("X-Metabase-Session")
 	cur, _ := f.sessionToken.Load().(string)
 	if got == "" || got != cur {
@@ -140,3 +165,60 @@ func (f *FakeMetabase) checkSession(w http.ResponseWriter, r *http.Request) bool
 	return true
 }
 
+func (f *FakeMetabase) handlePRM(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{
+		"resource":                 f.srv.URL + "/api/metabase-mcp",
+		"authorization_servers":    []string{f.srv.URL},
+		"scopes_supported":         []string{"mb:full"},
+		"bearer_methods_supported": []string{"header"},
+	})
+}
+
+func (f *FakeMetabase) handleASMeta(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{
+		"issuer":                                f.srv.URL,
+		"authorization_endpoint":                f.srv.URL + "/oauth/authorize",
+		"token_endpoint":                        f.srv.URL + "/oauth/token",
+		"registration_endpoint":                 f.srv.URL + "/oauth/register",
+		"scopes_supported":                      []string{"mb:full"},
+		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
+		"code_challenge_methods_supported":      []string{"S256"},
+		"token_endpoint_auth_methods_supported": []string{"none"},
+		"response_types_supported":              []string{"code"},
+	})
+}
+
+func (f *FakeMetabase) handleOAuthRegister(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, map[string]any{
+		"client_id":                  "e2e-client",
+		"token_endpoint_auth_method": "none",
+		"grant_types":                []string{"authorization_code", "refresh_token"},
+		"response_types":             []string{"code"},
+	})
+}
+
+func (f *FakeMetabase) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
+	redirectURI := r.URL.Query().Get("redirect_uri")
+	state := r.URL.Query().Get("state")
+	http.Redirect(w, r, redirectURI+"?code=e2e-code&state="+state, http.StatusFound)
+}
+
+func (f *FakeMetabase) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	n := f.tokenCalls.Add(1)
+	access := "at-" + strconv.Itoa(int(n))
+	refresh := "rt-" + strconv.Itoa(int(n))
+	f.issuedAccess.Store(access)
+	writeJSON(w, map[string]any{
+		"access_token":  access,
+		"token_type":    "Bearer",
+		"expires_in":    3600,
+		"refresh_token": refresh,
+	})
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}

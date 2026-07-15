@@ -18,7 +18,7 @@ func newTestClient(srv *httptest.Server) *Client {
 	hc := srv.Client()
 	c := &Client{
 		baseURL: srv.URL,
-		session: newSessionManager(srv.URL, "u", "p", hc, []time.Duration{0, 0, 0}),
+		auth:    newSessionManager(srv.URL, "u", "p", hc, []time.Duration{0, 0, 0}),
 		http:    hc,
 		log:     logging.Discard(),
 	}
