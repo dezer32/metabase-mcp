@@ -10,7 +10,7 @@ Read-only MCP server on top of the Metabase REST API. Gives an LLM client (Claud
 |---|---|
 | `list_databases` | List of databases connected to Metabase with their `id` and `engine`. Cached for 5 minutes. |
 | `list_tables` | Flat schema of a single database: tables, typed columns, foreign keys. Cached for 5 minutes per `database_id`. |
-| `execute_sql` | Executes a SQL query through `/api/dataset`. Only `SELECT` and `WITH ... SELECT` are allowed. |
+| `execute_sql` | Executes a SQL query through `/api/dataset`. Only `SELECT` and `WITH ... SELECT` are allowed. Paginates via `LIMIT`/`OFFSET` in the query; a large result is spooled to a local NDJSON file and returned as a resource link. |
 
 ### Read-only guarantees
 
@@ -21,6 +21,40 @@ Read-only MCP server on top of the Metabase REST API. Gives an LLM client (Claud
 - `SELECT ... INTO OUTFILE/DUMPFILE`;
 - `FOR UPDATE`, `LOCK IN SHARE MODE`;
 - Comment-based bypasses like `/* SELECT */ DROP TABLE x` (the parser sees the AST, not the raw string).
+
+### Pagination
+
+**Pagination lives in the SQL itself.** There are no `limit`/`offset` tool arguments: pass `LIMIT` and `OFFSET` in the query and walk pages by raising `OFFSET`.
+
+If the query has no top-level `LIMIT`, the server appends `LIMIT <row_limit> OFFSET 0`, returns the executed SQL in `meta.effective_sql` and adds a note to `meta.warnings`. `meta.next_offset` points at the offset of the next page (a hint — check `meta.row_count` to see whether the page was full). Set `EXECUTE_SQL_AUTO_LIMIT=false` to disable the rewrite; you then only get the warning.
+
+The clause is **inserted** at the end of the statement body, not appended to the string, so a trailing `;` or comment survives: `SELECT 1; -- note` becomes `SELECT 1 LIMIT 1000 OFFSET 0; -- note`. A top-level `LIMIT` that is already there is never touched.
+
+`row_limit` is a different mechanism and both stay:
+
+| | `row_limit` | `LIMIT`/`OFFSET` in the SQL |
+|---|---|---|
+| Where it goes | `constraints.max-results` | text of the native query |
+| Who applies it | Metabase, **after** the query ran on the database | the database itself |
+| Role | safety cap against OOM, and the value used when the server has to append a `LIMIT` | pagination, driven by the client |
+
+When Metabase itself cuts the result short it reports `data.rows_truncated`; that surfaces as `meta.truncated`, `meta.truncated_at` and a warning, so a partial result is never silently passed off as complete.
+
+**Known limitation:** `sqlguard` parses with TiDB's MySQL grammar, so genuinely Postgres/ClickHouse-only syntax (`::` casts, `DISTINCT ON`, `FILTER (WHERE …)`, `ARRAY[…]`) does not pass validation in the first place. Whatever does pass is MySQL-compatible and understands `LIMIT n OFFSET m`.
+
+### Large results (result spool)
+
+A result whose serialized rows exceed `RESULT_INLINE_MAX_BYTES` (64 KiB by default) is **not** inlined. Instead it is written to a local NDJSON file (one row object per line) and the tool returns:
+
+- `rows: null`, `meta.delivery: "file"`;
+- `resource` with `uri` (`metabase://result/<id>`), `bytes`, `row_count`, a `preview` of the first `RESULT_PREVIEW_ROWS` rows, and — on stdio, where the client is a process on the same machine — the local `path`;
+- a `resource_link` content block, so an MCP host can fetch the full set via `resources/read` on that URI. The `_meta` of that resource carries the column `key`↔`name` mapping needed to untangle duplicate names from a `JOIN`.
+
+Why it matters: the SDK sends the payload to the client **twice** (as `structuredContent` and again as `content[0].text`), and every row object repeats every column name. 50k rows would land in the model's context in full, twice. 64 KiB of dense JSON is roughly 18–20k tokens — useful when tuning the threshold.
+
+Force either mode with the `delivery` argument: `auto` (default), `inline`, `file`. If the spool is unavailable, `execute_sql` still succeeds: it falls back to inline and says so in `meta.warnings`.
+
+**Data at rest.** This is the one place where the server writes query results to disk. Files live in `RESULT_SPOOL_DIR` (default `$TMPDIR/metabase-mcp/results`) with mode `0600` in a `0700` directory, under random 16-hex-character names. They are removed when the TTL expires, when the total size exceeds `RESULT_SPOOL_MAX_BYTES` (oldest first), and on process shutdown; leftovers from a `kill -9` are swept on the next start. Set `RESULT_SPOOL_ENABLED=false` to keep results in memory only — `execute_sql` then always returns rows inline.
 
 ## Configuration
 
@@ -33,6 +67,18 @@ Passed via environment variables:
 | `METABASE_PASSWORD` | mode | — | Metabase password. |
 | `LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. |
 | `HTTP_TIMEOUT` | no | `30s` | Any `time.ParseDuration` string (`10s`, `1m`). |
+
+Result delivery and pagination:
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXECUTE_SQL_AUTO_LIMIT` | `true` | Append `LIMIT <row_limit> OFFSET 0` when the query has no top-level `LIMIT`. `false` → only warn. |
+| `RESULT_INLINE_MAX_BYTES` | `65536` | Size of the serialized rows above which the result goes to a file. `0` → always inline. ≈18–20k tokens per 64 KiB of dense JSON. |
+| `RESULT_PREVIEW_ROWS` | `5` | How many first rows to include in `resource.preview`. `0` → no preview. |
+| `RESULT_SPOOL_ENABLED` | `true` | `false` → never write results to disk; always inline. |
+| `RESULT_SPOOL_DIR` | `$TMPDIR/metabase-mcp/results` | Where spooled results live. Directory `0700`, files `0600`. |
+| `RESULT_SPOOL_TTL` | `1h` | How long a spooled result stays readable. Any `time.ParseDuration` string. |
+| `RESULT_SPOOL_MAX_BYTES` | `268435456` (256 MiB) | Total size cap for the spool directory; oldest results are evicted first. |
 
 **Auth mode is chosen by presence of credentials:** both `METABASE_USER` and `METABASE_PASSWORD` set → **password mode**; neither set → **OAuth mode**; exactly one set → configuration error.
 
@@ -177,9 +223,11 @@ Integration tests live in `test/` under the `integration` build tag. `test/fake_
 main.go
  └── server (mcp.Server)
       ├── tools (list_databases, list_tables, execute_sql)
+      │    │    + resource template metabase://result/{id}
       │    ├── metabase.Client  ← HTTP client for the Metabase REST API
-      │    ├── sqlguard.Validate ← TiDB AST parser
+      │    ├── sqlguard         ← TiDB AST parser: validation + LIMIT/OFFSET facts and rewrite
       │    ├── schema           ← lean DTOs for the LLM
+      │    ├── spool            ← NDJSON files for large results (TTL + eviction)
       │    └── cache            ← TTL cache (5 min)
       └── transport (stdio)
 ```

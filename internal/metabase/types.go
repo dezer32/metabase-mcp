@@ -2,7 +2,10 @@
 // Не знает про MCP. Может быть использован в отрыве.
 package metabase
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 // Database — урезанная DTO для GET /api/database.
 // Metabase возвращает больше полей, парсим только то, что нужно.
@@ -65,6 +68,38 @@ type DatasetResponse struct {
 type DatasetData struct {
 	Cols []DatasetCol `json:"cols"`
 	Rows [][]any      `json:"rows"`
+	// RowsTruncated — сигнал самого Metabase о том, что результат обрезали
+	// по constraints. Ключ лежит под data, значение — integer, равный лимиту
+	// обрезки (query_processor/middleware/add_rows_truncated.clj:
+	// (assoc-in [:data truncated-key] limit)); при отсутствии обрезания
+	// ключа нет вовсе.
+	//
+	// Тип RawMessage, а НЕ *int: если какая-то версия отдаст true,
+	// json.Unmarshal в *int вернёт ошибку, и doJSON уронит весь успешный
+	// запрос. Слишком дорого за поле-предупреждение. Тот же приём уже
+	// применён к Error выше.
+	RowsTruncated json.RawMessage `json:"rows_truncated,omitempty"`
+}
+
+// Truncated интерпретирует rows_truncated терпимо: число → (n, true),
+// true → (0, true), отсутствие/false/мусор → (0, false).
+func (d *DatasetData) Truncated() (int, bool) {
+	if d == nil {
+		return 0, false
+	}
+	raw := bytes.TrimSpace(d.RowsTruncated)
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, false
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n, true
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		return 0, b
+	}
+	return 0, false
 }
 
 // DatasetCol — колонка результата запроса.

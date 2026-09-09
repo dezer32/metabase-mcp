@@ -10,7 +10,7 @@ Read-only MCP-сервер поверх REST-API Metabase. Даёт LLM-клие
 |---|---|
 | `list_databases` | Список подключённых к Metabase баз с их `id` и `engine`. Кэш 5 минут. |
 | `list_tables` | Плоская схема одной БД: таблицы, колонки с типами, foreign keys. Кэш 5 минут на `database_id`. |
-| `execute_sql` | Выполнение SQL-запроса через `/api/dataset`. Только `SELECT` и `WITH ... SELECT`. |
+| `execute_sql` | Выполнение SQL-запроса через `/api/dataset`. Только `SELECT` и `WITH ... SELECT`. Пагинация — через `LIMIT`/`OFFSET` в запросе; большой результат уходит в локальный NDJSON-файл и возвращается resource link'ом. |
 
 ### Read-only гарантии
 
@@ -21,6 +21,40 @@ Read-only MCP-сервер поверх REST-API Metabase. Даёт LLM-клие
 - `SELECT ... INTO OUTFILE/DUMPFILE`;
 - `FOR UPDATE`, `LOCK IN SHARE MODE`;
 - Комментарий-обходчики типа `/* SELECT */ DROP TABLE x` (парсер видит AST, не строку).
+
+### Пагинация
+
+**Пагинация живёт в самом SQL.** Аргументов `limit`/`offset` у tool'а нет: передавайте `LIMIT` и `OFFSET` в запросе и листайте страницы, увеличивая `OFFSET`.
+
+Если верхнеуровневого `LIMIT` в запросе нет, сервер дописывает `LIMIT <row_limit> OFFSET 0`, возвращает исполненный SQL в `meta.effective_sql` и добавляет запись в `meta.warnings`. `meta.next_offset` указывает на offset следующей страницы (это подсказка — полнота страницы видна по `meta.row_count`). `EXECUTE_SQL_AUTO_LIMIT=false` отключает автоподстановку, остаётся только предупреждение.
+
+Клауза **вставляется** в конец тела statement'а, а не дописывается в конец строки, поэтому хвостовой `;` или комментарий выживают: `SELECT 1; -- заметка` превращается в `SELECT 1 LIMIT 1000 OFFSET 0; -- заметка`. Уже имеющийся верхнеуровневый `LIMIT` не трогается вообще.
+
+`row_limit` — другой механизм, и остаются оба:
+
+| | `row_limit` | `LIMIT`/`OFFSET` в SQL |
+|---|---|---|
+| Куда идёт | `constraints.max-results` | текст native-запроса |
+| Кто применяет | Metabase, **после** выполнения запроса на БД | сама БД |
+| Роль | предохранитель от OOM и значение для автоподстановки `LIMIT` | пагинация, задаёт клиент |
+
+Когда результат обрезал сам Metabase, он сообщает об этом в `data.rows_truncated`; наружу это выходит как `meta.truncated`, `meta.truncated_at` и предупреждение — частичный результат никогда не выдаётся за полный.
+
+**Известное ограничение:** `sqlguard` парсит MySQL-грамматикой TiDB, поэтому настоящий Postgres/ClickHouse-синтаксис (`::` касты, `DISTINCT ON`, `FILTER (WHERE …)`, `ARRAY[…]`) не проходит валидацию в принципе. То, что проходит, MySQL-совместимо и `LIMIT n OFFSET m` понимает.
+
+### Большие результаты (спул)
+
+Результат, сериализованные строки которого превышают `RESULT_INLINE_MAX_BYTES` (по умолчанию 64 KiB), инлайном **не** отдаётся. Вместо этого он пишется в локальный NDJSON-файл (по объекту-строке на строку файла), а tool возвращает:
+
+- `rows: null`, `meta.delivery: "file"`;
+- `resource` с `uri` (`metabase://result/<id>`), `bytes`, `row_count`, превью первых `RESULT_PREVIEW_ROWS` строк и — на stdio, где клиент является процессом на той же машине, — локальный `path`;
+- content-блок `resource_link`, чтобы MCP-хост мог забрать полный набор через `resources/read` по этому URI. В `_meta` того ресурса лежит маппинг `key`↔`name` колонок, без которого не разобрать дубликаты имён из `JOIN`.
+
+Зачем это нужно: SDK отправляет payload клиенту **дважды** (в `structuredContent` и ещё раз в `content[0].text`), а каждый объект-строка повторяет имя каждой колонки. 50k строк уехали бы в контекст модели целиком, два раза. 64 KiB плотного JSON — это примерно 18–20k токенов; коэффициент полезен при подборе порога.
+
+Режим форсируется аргументом `delivery`: `auto` (по умолчанию), `inline`, `file`. Если спул недоступен, `execute_sql` всё равно успешен: откатывается к inline и пишет об этом в `meta.warnings`.
+
+**Данные на диске.** Это единственное место, где сервер пишет результаты запросов на диск. Файлы лежат в `RESULT_SPOOL_DIR` (по умолчанию `$TMPDIR/metabase-mcp/results`) с правами `0600` в каталоге `0700`, под случайными именами из 16 hex-символов. Они удаляются по истечении TTL, при превышении `RESULT_SPOOL_MAX_BYTES` (сначала самые старые) и при остановке процесса; остатки после `kill -9` подчищаются на следующем старте. `RESULT_SPOOL_ENABLED=false` держит результаты только в памяти — тогда `execute_sql` всегда отдаёт строки инлайном.
 
 ## Конфигурация
 
@@ -33,6 +67,18 @@ Read-only MCP-сервер поверх REST-API Metabase. Даёт LLM-клие
 | `METABASE_PASSWORD` | режим | — | Пароль Metabase. |
 | `LOG_LEVEL` | нет | `info` | `debug`, `info`, `warn`, `error`. |
 | `HTTP_TIMEOUT` | нет | `30s` | Любая строка `time.ParseDuration` (`10s`, `1m`). |
+
+Выдача результата и пагинация:
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `EXECUTE_SQL_AUTO_LIMIT` | `true` | Дописывать `LIMIT <row_limit> OFFSET 0`, если верхнеуровневого `LIMIT` в запросе нет. `false` → только предупреждать. |
+| `RESULT_INLINE_MAX_BYTES` | `65536` | Размер сериализованных строк, выше которого результат уходит в файл. `0` → всегда inline. ≈18–20k токенов на 64 KiB плотного JSON. |
+| `RESULT_PREVIEW_ROWS` | `5` | Сколько первых строк класть в `resource.preview`. `0` → без превью. |
+| `RESULT_SPOOL_ENABLED` | `true` | `false` → никогда не писать результаты на диск, всегда inline. |
+| `RESULT_SPOOL_DIR` | `$TMPDIR/metabase-mcp/results` | Где лежат спуленные результаты. Каталог `0700`, файлы `0600`. |
+| `RESULT_SPOOL_TTL` | `1h` | Сколько спуленный результат остаётся читаемым. Любая строка `time.ParseDuration`. |
+| `RESULT_SPOOL_MAX_BYTES` | `268435456` (256 MiB) | Суммарный лимит на каталог спула; вытесняются самые старые результаты. |
 
 **Режим аутентификации выбирается по наличию учёток:** заданы и `METABASE_USER`, и `METABASE_PASSWORD` → **password-режим**; не задан ни один → **OAuth-режим**; задан ровно один → ошибка конфигурации.
 
@@ -177,9 +223,11 @@ make test-integration    # e2e: build бинаря + FakeMetabase + реальн
 main.go
  └── server (mcp.Server)
       ├── tools (list_databases, list_tables, execute_sql)
+      │    │    + шаблон ресурса metabase://result/{id}
       │    ├── metabase.Client  ← HTTP-клиент к Metabase REST API
-      │    ├── sqlguard.Validate ← TiDB AST-парсер
+      │    ├── sqlguard         ← TiDB AST-парсер: валидация + факты о LIMIT/OFFSET и вставка
       │    ├── schema           ← lean DTO для LLM
+      │    ├── spool            ← NDJSON-файлы больших результатов (TTL + вытеснение)
       │    └── cache            ← TTL-кэш (5 мин)
       └── transport (stdio)
 ```

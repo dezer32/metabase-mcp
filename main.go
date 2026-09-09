@@ -51,11 +51,18 @@ func run() error {
 
 	// В oauth-режиме здесь может произойти интерактивный вход при первом старте
 	// (ссылка в stderr + браузер). Дальнейшие старты — неинтерактивный refresh.
-	srv, err := server.New(ctx, cfg, log)
+	inst, err := server.New(ctx, cfg, *transport, log)
 	if err != nil {
 		return fmt.Errorf("server: %w", err)
 	}
-	if err := server.Run(ctx, srv, *transport, log); err != nil && !errors.Is(err, context.Canceled) {
+	// Спуленные файлы результатов живут не дольше процесса.
+	defer func() {
+		if cerr := inst.Close(); cerr != nil {
+			log.Warn("server cleanup", slog.String("err", cerr.Error()))
+		}
+	}()
+
+	if err := server.Run(ctx, inst.MCP, *transport, log); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
 	return nil

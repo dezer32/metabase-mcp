@@ -7,12 +7,20 @@ import (
 )
 
 // Result — выходной формат для tool execute_sql.
-// Rows — массив объектов (по строке на запись).
+// Rows — массив объектов (по строке на запись); в file-режиме — nil,
+// строки лежат в файле, на который указывает Resource.
 // Meta содержит счётчики и оригинальные имена столбцов (важно для JOIN-ов
 // с дубликатами имён).
+//
+// ВНИМАНИЕ: go-sdk валидирует выход по выведенной output schema на каждом
+// вызове, а у struct'ов там additionalProperties: false. Поэтому правки
+// строго аддитивные и только с omitempty (такие поля не попадают в
+// required). Переименовать или удалить rows/meta нельзя — сломает
+// клиентов, запинивших схему.
 type Result struct {
-	Rows []map[string]any `json:"rows"`
-	Meta Meta             `json:"meta"`
+	Rows     []map[string]any `json:"rows"`
+	Meta     Meta             `json:"meta"`
+	Resource *ResultRef       `json:"resource,omitempty"` // только в file-режиме
 }
 
 // Meta — метаданные результата.
@@ -20,6 +28,24 @@ type Meta struct {
 	RowCount  int          `json:"row_count"`
 	RunningMs int64        `json:"running_ms"`
 	Columns   []ColumnMeta `json:"columns"`
+
+	Delivery     string   `json:"delivery,omitempty"`      // inline | file
+	EffectiveSQL string   `json:"effective_sql,omitempty"` // если сервер дописал клаузу
+	NextOffset   *int64   `json:"next_offset,omitempty"`   // подсказка для следующей страницы
+	Truncated    bool     `json:"truncated,omitempty"`     // Metabase обрезал результат
+	TruncatedAt  int      `json:"truncated_at,omitempty"`
+	Warnings     []string `json:"warnings,omitempty"`
+}
+
+// ResultRef — ссылка на файл с полным результатом (NDJSON, по объекту-строке
+// на строку файла).
+type ResultRef struct {
+	URI      string           `json:"uri"`            // metabase://result/<id>
+	Path     string           `json:"path,omitempty"` // пусто на нелокальном транспорте
+	MIMEType string           `json:"mime_type"`
+	Bytes    int64            `json:"bytes"`
+	RowCount int              `json:"row_count"`
+	Preview  []map[string]any `json:"preview,omitempty"`
 }
 
 // ColumnMeta — описание одной колонки результата.

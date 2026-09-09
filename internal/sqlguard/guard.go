@@ -8,7 +8,6 @@ package sqlguard
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/pingcap/tidb/pkg/parser"
@@ -24,29 +23,13 @@ var parserPool = sync.Pool{
 
 // Validate возвращает nil, если query — это один валидный read-only SELECT/WITH.
 // Иначе — ошибку с понятным текстом для пользователя.
+//
+// Вся работа — в Inspect: он и валидирует, и собирает факты о LIMIT/OFFSET
+// за тот же один парс. Validate оставлен для вызывающих, которым факты
+// не нужны.
 func Validate(query string) error {
-	if strings.TrimSpace(query) == "" {
-		return errors.New("empty query")
-	}
-
-	p, ok := parserPool.Get().(*parser.Parser)
-	if !ok {
-		p = parser.New()
-	}
-	defer parserPool.Put(p)
-
-	stmts, _, err := p.Parse(query, "", "")
-	if err != nil {
-		return fmt.Errorf("syntax error: %w", err)
-	}
-	if len(stmts) == 0 {
-		// Голый комментарий или пробел.
-		return errors.New("empty query")
-	}
-	if len(stmts) != 1 {
-		return errors.New("разрешён ровно один statement")
-	}
-	return checkReadOnly(stmts[0])
+	_, err := Inspect(query)
+	return err
 }
 
 // checkReadOnly проходит по AST и отказывает всему, что не read-only SELECT.

@@ -5,30 +5,39 @@ import (
 	"testing"
 )
 
-func TestValidate_Positive(t *testing.T) {
-	cases := []struct {
-		name string
-		q    string
-	}{
-		{"simple SELECT", "SELECT 1"},
-		{"SELECT with FROM", "SELECT id FROM users"},
-		{"JOIN", "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id"},
-		{"CTE", "WITH t AS (SELECT 1 AS n) SELECT n FROM t"},
-		{"CTE multiple", "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b"},
-		{"UNION ALL", "SELECT id FROM t1 UNION ALL SELECT id FROM t2"},
-		{"UNION", "SELECT id FROM t1 UNION SELECT id FROM t2"},
-		{"INTERSECT", "SELECT id FROM t1 INTERSECT SELECT id FROM t2"},
-		{"EXCEPT", "SELECT id FROM t1 EXCEPT SELECT id FROM t2"},
-		{"SELECT *", "SELECT * FROM users WHERE id < 10"},
-		{"comment then SELECT", "/* note */ SELECT 1"},
-		{"comment with INSERT inside string", `SELECT 'INSERT INTO bad' AS msg`},
-		{"window function", "SELECT id, ROW_NUMBER() OVER (PARTITION BY x ORDER BY y) FROM t"},
-		{"subquery in SELECT", "SELECT (SELECT COUNT(*) FROM orders) AS n"},
-		{"GROUP BY HAVING", "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 5"},
-		{"trailing semicolon", "SELECT 1;"},
-		{"trailing semicolon with whitespace", "SELECT 1  ;  "},
+// validateCase — один кейс таблицы. Таблицы вынесены в функции, потому что
+// их переиспользуют TestInspect_MatchesValidate и
+// TestWithLimitOffset_RoundTrip.
+type validateCase struct {
+	name    string
+	q       string
+	errFrag string
+}
+
+func validatePositiveCases() []validateCase {
+	return []validateCase{
+		{"simple SELECT", "SELECT 1", ""},
+		{"SELECT with FROM", "SELECT id FROM users", ""},
+		{"JOIN", "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id", ""},
+		{"CTE", "WITH t AS (SELECT 1 AS n) SELECT n FROM t", ""},
+		{"CTE multiple", "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b", ""},
+		{"UNION ALL", "SELECT id FROM t1 UNION ALL SELECT id FROM t2", ""},
+		{"UNION", "SELECT id FROM t1 UNION SELECT id FROM t2", ""},
+		{"INTERSECT", "SELECT id FROM t1 INTERSECT SELECT id FROM t2", ""},
+		{"EXCEPT", "SELECT id FROM t1 EXCEPT SELECT id FROM t2", ""},
+		{"SELECT *", "SELECT * FROM users WHERE id < 10", ""},
+		{"comment then SELECT", "/* note */ SELECT 1", ""},
+		{"comment with INSERT inside string", `SELECT 'INSERT INTO bad' AS msg`, ""},
+		{"window function", "SELECT id, ROW_NUMBER() OVER (PARTITION BY x ORDER BY y) FROM t", ""},
+		{"subquery in SELECT", "SELECT (SELECT COUNT(*) FROM orders) AS n", ""},
+		{"GROUP BY HAVING", "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 5", ""},
+		{"trailing semicolon", "SELECT 1;", ""},
+		{"trailing semicolon with whitespace", "SELECT 1  ;  ", ""},
 	}
-	for _, tc := range cases {
+}
+
+func TestValidate_Positive(t *testing.T) {
+	for _, tc := range validatePositiveCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := Validate(tc.q); err != nil {
 				t.Errorf("Validate(%q) = %v, want nil", tc.q, err)
@@ -37,12 +46,8 @@ func TestValidate_Positive(t *testing.T) {
 	}
 }
 
-func TestValidate_Negative(t *testing.T) {
-	cases := []struct {
-		name    string
-		q       string
-		errFrag string
-	}{
+func validateNegativeCases() []validateCase {
+	return []validateCase{
 		{"empty", "", "empty"},
 		{"whitespace", "   ", "empty"},
 		{"comment only", "/* just a comment */", "empty"},
@@ -80,7 +85,10 @@ func TestValidate_Negative(t *testing.T) {
 		{"DEALLOCATE", "DEALLOCATE PREPARE s", "SELECT"},
 		{"syntax error", "SELECT FROM WHERE", "syntax"},
 	}
-	for _, tc := range cases {
+}
+
+func TestValidate_Negative(t *testing.T) {
+	for _, tc := range validateNegativeCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			err := Validate(tc.q)
 			if err == nil {

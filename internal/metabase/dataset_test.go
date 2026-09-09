@@ -174,3 +174,44 @@ func TestDataset_BodyShape(t *testing.T) {
 		t.Errorf("constraints.max-results-bare-rows: %v", got)
 	}
 }
+
+// TestDataset_RowsTruncated — Metabase кладёт rows_truncated под data.
+// Главное требование: НИ ОДНА форма значения не должна уронить успешный
+// запрос, поэтому поле — RawMessage, а не *int.
+func TestDataset_RowsTruncated(t *testing.T) {
+	cases := []struct {
+		name    string
+		dataRaw string
+		wantN   int
+		wantOK  bool
+	}{
+		{"integer", `"rows_truncated": 1000,`, 1000, true},
+		{"bool true", `"rows_truncated": true,`, 0, true},
+		{"bool false", `"rows_truncated": false,`, 0, false},
+		{"string garbage", `"rows_truncated": "yes",`, 0, false},
+		{"null", `"rows_truncated": null,`, 0, false},
+		{"absent", ``, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"status":"completed","data":{` + tc.dataRaw +
+				`"cols":[{"name":"id"}],"rows":[[1]]}}`
+			srv := datasetServer(body, http.StatusOK)
+			defer srv.Close()
+			c := newTestClient(srv)
+
+			res, err := c.Dataset(context.Background(), 3, "SELECT id FROM t", 100)
+			if err != nil {
+				t.Fatalf("Dataset must not fail on rows_truncated=%s: %v", tc.dataRaw, err)
+			}
+			n, ok := res.Data.Truncated()
+			if n != tc.wantN || ok != tc.wantOK {
+				t.Errorf("Truncated() = (%d, %v), want (%d, %v)", n, ok, tc.wantN, tc.wantOK)
+			}
+			// Строки должны доехать в любом случае.
+			if len(res.Data.Rows) != 1 {
+				t.Errorf("rows: %d, want 1", len(res.Data.Rows))
+			}
+		})
+	}
+}

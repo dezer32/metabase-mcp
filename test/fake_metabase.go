@@ -32,6 +32,12 @@ type FakeMetabase struct {
 	databases    []map[string]any
 	metadataByDB map[int]map[string]any
 	dataset      map[string]any
+
+	// Управление ответом /api/dataset и слепок последнего запроса.
+	datasetRows     int // >0 → генерировать n строк вместо статики
+	datasetTruncAt  int // >0 → добавить data.rows_truncated
+	lastQuery       string
+	lastConstraints map[string]any
 }
 
 // NewFakeMetabase запускает фейковый сервер.
@@ -132,15 +138,98 @@ func (f *FakeMetabase) handleMetadata(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(meta)
 }
 
+// SetDatasetRows заставляет /api/dataset генерировать n строк вместо
+// статического ответа. Нужно, чтобы e2e проверил уход результата в файл.
+func (f *FakeMetabase) SetDatasetRows(n int) {
+	f.mu.Lock()
+	f.datasetRows = n
+	f.mu.Unlock()
+}
+
+// SetDatasetTruncatedAt добавляет в ответ data.rows_truncated = n —
+// сигнал Metabase о том, что результат обрезали по constraints.
+func (f *FakeMetabase) SetDatasetTruncatedAt(n int) {
+	f.mu.Lock()
+	f.datasetTruncAt = n
+	f.mu.Unlock()
+}
+
+// LastDatasetQuery — native.query последнего запроса к /api/dataset.
+func (f *FakeMetabase) LastDatasetQuery() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastQuery
+}
+
+// LastDatasetConstraints — constraints последнего запроса к /api/dataset.
+func (f *FakeMetabase) LastDatasetConstraints() map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastConstraints
+}
+
 func (f *FakeMetabase) handleDataset(w http.ResponseWriter, r *http.Request) {
 	if !f.checkAuth(w, r) {
 		return
 	}
+	var body struct {
+		Native struct {
+			Query string `json:"query"`
+		} `json:"native"`
+		Constraints map[string]any `json:"constraints"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
 	f.mu.Lock()
+	f.lastQuery = body.Native.Query
+	f.lastConstraints = body.Constraints
 	payload := f.dataset
+	if f.datasetRows > 0 {
+		payload = generatedDataset(f.datasetRows)
+	}
+	if f.datasetTruncAt > 0 {
+		payload = withTruncated(payload, f.datasetTruncAt)
+	}
 	f.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// generatedDataset — n строк с двумя колонками.
+func generatedDataset(n int) map[string]any {
+	rows := make([][]any, n)
+	for i := range rows {
+		rows[i] = []any{i, "value-" + strconv.Itoa(i)}
+	}
+	return map[string]any{
+		"status":       "completed",
+		"running_time": 9,
+		"data": map[string]any{
+			"cols": []map[string]any{
+				{"name": "id", "base_type": "type/Integer"},
+				{"name": "label", "base_type": "type/Text"},
+			},
+			"rows": rows,
+		},
+	}
+}
+
+// withTruncated возвращает КОПИЮ payload с data.rows_truncated — исходный
+// f.dataset мутировать нельзя, его читают параллельные запросы.
+func withTruncated(payload map[string]any, at int) map[string]any {
+	out := make(map[string]any, len(payload))
+	for k, v := range payload {
+		out[k] = v
+	}
+	data, _ := payload["data"].(map[string]any)
+	nd := make(map[string]any, len(data)+1)
+	for k, v := range data {
+		nd[k] = v
+	}
+	nd["rows_truncated"] = at
+	out["data"] = nd
+	return out
 }
 
 // checkAuth принимает ЛИБО валидный X-Metabase-Session, ЛИБО Authorization:

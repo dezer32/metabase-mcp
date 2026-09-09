@@ -6,10 +6,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -44,6 +46,15 @@ type Config struct {
 	OAuthNoninteractive    bool          // true → не поднимать браузер/DCR, только refresh
 	OAuthResourceOnRefresh bool          // слать RFC 8707 resource на refresh; дефолт true
 	TokenFile              string        // путь к персисту токена
+
+	// Спул больших результатов execute_sql и автоподстановка LIMIT.
+	ResultSpoolEnabled   bool          // RESULT_SPOOL_ENABLED; дефолт true
+	ResultSpoolDir       string        // RESULT_SPOOL_DIR; "" → $TMPDIR/metabase-mcp/results
+	ResultSpoolTTL       time.Duration // RESULT_SPOOL_TTL; дефолт 1h
+	ResultSpoolMaxBytes  int64         // RESULT_SPOOL_MAX_BYTES; дефолт 256 MiB
+	ResultInlineMaxBytes int           // RESULT_INLINE_MAX_BYTES; дефолт 64 KiB
+	ResultPreviewRows    int           // RESULT_PREVIEW_ROWS; дефолт 5
+	ExecuteSQLAutoLimit  bool          // EXECUTE_SQL_AUTO_LIMIT; дефолт true
 }
 
 // Load читает все нужные env-переменные и валидирует их.
@@ -100,8 +111,66 @@ func Load() (Config, error) {
 	if err := loadOAuth(&cfg); err != nil {
 		return Config{}, err
 	}
+	if err := loadResults(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	return cfg, nil
+}
+
+// loadResults парсит настройки выдачи результата execute_sql: спул больших
+// ответов в файл и автоподстановку LIMIT/OFFSET.
+//
+// Дефолты «включено»: спул экономит контекст модели, а без LIMIT'а в SQL
+// пагинации нет вовсе. Выключатели — RESULT_SPOOL_ENABLED=false и
+// EXECUTE_SQL_AUTO_LIMIT=false.
+func loadResults(cfg *Config) error {
+	enabled, err := parseBool("RESULT_SPOOL_ENABLED", true)
+	if err != nil {
+		return err
+	}
+	cfg.ResultSpoolEnabled = enabled
+
+	// Пустой Dir разрешён: каталог по умолчанию подставит сам spool.New.
+	cfg.ResultSpoolDir = strings.TrimSpace(os.Getenv("RESULT_SPOOL_DIR"))
+
+	cfg.ResultSpoolTTL = time.Hour
+	if raw := os.Getenv("RESULT_SPOOL_TTL"); strings.TrimSpace(raw) != "" {
+		d, perr := time.ParseDuration(raw)
+		if perr != nil {
+			return fmt.Errorf("RESULT_SPOOL_TTL invalid: %w", perr)
+		}
+		if d <= 0 {
+			return fmt.Errorf("RESULT_SPOOL_TTL invalid: %s (must be positive)", d)
+		}
+		cfg.ResultSpoolTTL = d
+	}
+
+	maxBytes, err := parseIntEnv("RESULT_SPOOL_MAX_BYTES", 256<<20)
+	if err != nil {
+		return err
+	}
+	cfg.ResultSpoolMaxBytes = maxBytes
+
+	inlineMax, err := parseIntEnv("RESULT_INLINE_MAX_BYTES", 64<<10)
+	if err != nil {
+		return err
+	}
+	cfg.ResultInlineMaxBytes = int(inlineMax)
+
+	previewRows, err := parseIntEnv("RESULT_PREVIEW_ROWS", 5)
+	if err != nil {
+		return err
+	}
+	cfg.ResultPreviewRows = int(previewRows)
+
+	autoLimit, err := parseBool("EXECUTE_SQL_AUTO_LIMIT", true)
+	if err != nil {
+		return err
+	}
+	cfg.ExecuteSQLAutoLimit = autoLimit
+
+	return nil
 }
 
 // loadOAuth парсит OAuth-поля и проставляет дефолты. Валидирует формат
@@ -195,6 +264,29 @@ func parseBool(envName string, def bool) (bool, error) {
 	default:
 		return false, fmt.Errorf("%s invalid: %q (allowed: true|false)", envName, raw)
 	}
+}
+
+// parseIntEnv читает целочисленный env по имени. Пусто → def.
+// Отрицательные значения отвергает: все пороги здесь — байты и строки,
+// «минус» для них смысла не имеет, а 0 означает «выключено».
+// Верхняя граница — math.MaxInt, чтобы int(...) на вызывающей стороне
+// не переполнился на 32-битной сборке.
+func parseIntEnv(envName string, def int64) (int64, error) {
+	raw := strings.TrimSpace(os.Getenv(envName))
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s invalid: %q (expected an integer)", envName, raw)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s invalid: %d (must be >= 0)", envName, n)
+	}
+	if n > math.MaxInt {
+		return 0, fmt.Errorf("%s invalid: %d (too large)", envName, n)
+	}
+	return n, nil
 }
 
 // parseScopes режет строку на scope'ы по пробелам и запятым, отбрасывая пустые.

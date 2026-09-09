@@ -21,6 +21,10 @@ func Run(ctx context.Context, srv *mcp.Server, transport string, log *slog.Logge
 		log.Info("transport: stdio")
 		return srv.Run(ctx, &mcp.StdioTransport{})
 	case "http":
+		// При реализации помнить: на HTTP клиент — не процесс на этой машине,
+		// поэтому tools.Limits.ExposeLocalPath должен остаться false
+		// (см. isLocalTransport в server.go), иначе ResultRef.Path будет
+		// указывать на файл, которого у клиента нет.
 		return errors.New("http transport not implemented")
 	default:
 		return fmt.Errorf("unknown transport: %q", transport)

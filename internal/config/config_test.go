@@ -26,6 +26,13 @@ var allEnv = []string{
 	"METABASE_OAUTH_NONINTERACTIVE",
 	"METABASE_OAUTH_RESOURCE_ON_REFRESH",
 	"XDG_CONFIG_HOME",
+	"RESULT_SPOOL_ENABLED",
+	"RESULT_SPOOL_DIR",
+	"RESULT_SPOOL_TTL",
+	"RESULT_SPOOL_MAX_BYTES",
+	"RESULT_INLINE_MAX_BYTES",
+	"RESULT_PREVIEW_ROWS",
+	"EXECUTE_SQL_AUTO_LIMIT",
 }
 
 // withEnv устанавливает env-переменные на время теста, остальные чистит.
@@ -438,5 +445,117 @@ func TestLoad_HTTPTimeoutInvalid(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatalf("expected error for invalid HTTP_TIMEOUT")
+	}
+}
+
+func TestLoad_ResultDefaults(t *testing.T) {
+	withEnv(t, map[string]string{
+		"METABASE_URL":      "https://mb.example.com",
+		"METABASE_USER":     "u",
+		"METABASE_PASSWORD": "p",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.ResultSpoolEnabled {
+		t.Error("ResultSpoolEnabled должен быть true по умолчанию")
+	}
+	if cfg.ResultSpoolDir != "" {
+		t.Errorf("ResultSpoolDir = %q, want \"\" (дефолт подставит spool.New)", cfg.ResultSpoolDir)
+	}
+	if cfg.ResultSpoolTTL != time.Hour {
+		t.Errorf("ResultSpoolTTL = %s, want 1h", cfg.ResultSpoolTTL)
+	}
+	if cfg.ResultSpoolMaxBytes != 268435456 {
+		t.Errorf("ResultSpoolMaxBytes = %d, want 268435456", cfg.ResultSpoolMaxBytes)
+	}
+	if cfg.ResultInlineMaxBytes != 65536 {
+		t.Errorf("ResultInlineMaxBytes = %d, want 65536", cfg.ResultInlineMaxBytes)
+	}
+	if cfg.ResultPreviewRows != 5 {
+		t.Errorf("ResultPreviewRows = %d, want 5", cfg.ResultPreviewRows)
+	}
+	if !cfg.ExecuteSQLAutoLimit {
+		t.Error("ExecuteSQLAutoLimit должен быть true по умолчанию")
+	}
+}
+
+func TestLoad_ResultOverrides(t *testing.T) {
+	withEnv(t, map[string]string{
+		"METABASE_URL":            "https://mb.example.com",
+		"METABASE_USER":           "u",
+		"METABASE_PASSWORD":       "p",
+		"RESULT_SPOOL_ENABLED":    "false",
+		"RESULT_SPOOL_DIR":        "/var/tmp/mbmcp",
+		"RESULT_SPOOL_TTL":        "15m",
+		"RESULT_SPOOL_MAX_BYTES":  "1024",
+		"RESULT_INLINE_MAX_BYTES": "0",
+		"RESULT_PREVIEW_ROWS":     "3",
+		"EXECUTE_SQL_AUTO_LIMIT":  "off",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ResultSpoolEnabled {
+		t.Error("RESULT_SPOOL_ENABLED=false не применился")
+	}
+	if cfg.ResultSpoolDir != "/var/tmp/mbmcp" {
+		t.Errorf("ResultSpoolDir = %q", cfg.ResultSpoolDir)
+	}
+	if cfg.ResultSpoolTTL != 15*time.Minute {
+		t.Errorf("ResultSpoolTTL = %s", cfg.ResultSpoolTTL)
+	}
+	if cfg.ResultSpoolMaxBytes != 1024 {
+		t.Errorf("ResultSpoolMaxBytes = %d", cfg.ResultSpoolMaxBytes)
+	}
+	if cfg.ResultInlineMaxBytes != 0 {
+		t.Errorf("ResultInlineMaxBytes = %d, want 0", cfg.ResultInlineMaxBytes)
+	}
+	if cfg.ResultPreviewRows != 3 {
+		t.Errorf("ResultPreviewRows = %d", cfg.ResultPreviewRows)
+	}
+	if cfg.ExecuteSQLAutoLimit {
+		t.Error("EXECUTE_SQL_AUTO_LIMIT=off не применился")
+	}
+}
+
+func TestLoad_ResultInvalid(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     map[string]string
+		errFrag string
+	}{
+		{"bad ttl", map[string]string{"RESULT_SPOOL_TTL": "nope"}, "RESULT_SPOOL_TTL"},
+		{"zero ttl", map[string]string{"RESULT_SPOOL_TTL": "0s"}, "must be positive"},
+		{"negative ttl", map[string]string{"RESULT_SPOOL_TTL": "-1m"}, "must be positive"},
+		{"bad int", map[string]string{"RESULT_INLINE_MAX_BYTES": "64k"}, "RESULT_INLINE_MAX_BYTES"},
+		{"negative int", map[string]string{"RESULT_PREVIEW_ROWS": "-1"}, "must be >= 0"},
+		{"bad bool", map[string]string{"RESULT_SPOOL_ENABLED": "maybe"}, "RESULT_SPOOL_ENABLED"},
+		{"bad auto limit", map[string]string{"EXECUTE_SQL_AUTO_LIMIT": "maybe"}, "EXECUTE_SQL_AUTO_LIMIT"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{
+				"METABASE_URL":      "https://mb.example.com",
+				"METABASE_USER":     "u",
+				"METABASE_PASSWORD": "p",
+			}
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			withEnv(t, env)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() = nil, want error")
+			}
+			if !strings.Contains(err.Error(), tc.errFrag) {
+				t.Errorf("error %q should contain %q", err.Error(), tc.errFrag)
+			}
+		})
 	}
 }
