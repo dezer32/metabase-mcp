@@ -3,7 +3,7 @@ module github.com/dezer32/metabase-mcp
 go 1.26.3
 
 require (
-	github.com/modelcontextprotocol/go-sdk v1.6.0
+	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/pingcap/tidb/pkg/parser v0.0.0-20260519140245-64e215c51857
 	golang.org/x/oauth2 v0.35.0
 )
@@ -20,7 +20,9 @@ require (
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.19.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )

@@ -35,6 +35,8 @@ const (
 	deliveryFile   = "file"
 )
 
+const executeSQLTitle = "Execute SQL (read-only)"
+
 const executeSQLDesc = "Executes a read-only SQL query against a database via Metabase. " +
 	"Only SELECT and WITH (CTE) are allowed. " +
 	"Use the engine from list_databases to pick the right SQL dialect. " +
@@ -52,10 +54,7 @@ const executeSQLDesc = "Executes a read-only SQL query against a database via Me
 
 func registerExecuteSQL(server *mcp.Server, d Deps) {
 	mcp.AddTool(server,
-		&mcp.Tool{
-			Name:        "execute_sql",
-			Description: executeSQLDesc,
-		},
+		readOnlyTool("execute_sql", executeSQLTitle, executeSQLDesc),
 		func(ctx context.Context, _ *mcp.CallToolRequest, in executeSQLIn) (*mcp.CallToolResult, executeSQLOut, error) {
 			if in.DatabaseID <= 0 {
 				return nil, executeSQLOut{}, fmt.Errorf("execute_sql: database_id must be positive (got %d)", in.DatabaseID)
@@ -179,15 +178,9 @@ func fileResult(res executeSQLOut, e spool.Entry, l Limits) (*mcp.CallToolResult
 	}
 	out.Meta.Delivery = deliveryFile
 
-	size := e.Bytes
 	return &mcp.CallToolResult{Content: []mcp.Content{
 		&mcp.TextContent{Text: fileSummary(e, ref)},
-		&mcp.ResourceLink{
-			URI:      e.URI,
-			Name:     "execute_sql result",
-			MIMEType: e.MIMEType,
-			Size:     &size,
-		},
+		resultLink(e),
 	}}, out, nil
 }
 

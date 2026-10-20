@@ -7,20 +7,24 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dezer32/metabase-mcp/internal/metabase"
 	"github.com/dezer32/metabase-mcp/internal/spool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// fakeSpoolTTL — срок жизни результата в fakeSpool, как у боевого
+// дефолта RESULT_SPOOL_TTL.
+const fakeSpoolTTL = time.Hour
+
 // fakeSpool — мок Spool: держит один результат в памяти.
 type fakeSpool struct {
 	putCalls int
 	putErr   error
 
-	data []byte
-	meta map[string]any
-	rows int
+	data  []byte
+	entry spool.Entry
 }
 
 func (f *fakeSpool) Put(ndjson []byte, rowCount int, meta map[string]any) (spool.Entry, error) {
@@ -28,33 +32,29 @@ func (f *fakeSpool) Put(ndjson []byte, rowCount int, meta map[string]any) (spool
 	if f.putErr != nil {
 		return spool.Entry{}, f.putErr
 	}
-	f.data = ndjson
-	f.meta = meta
-	f.rows = rowCount
 	const id = "0123456789abcdef"
-	return spool.Entry{
-		ID:       id,
-		URI:      spool.URIFor(id),
-		Path:     "/tmp/metabase-mcp/results/" + id + ".ndjson",
-		MIMEType: spool.MIMEType,
-		Bytes:    int64(len(ndjson)),
-		RowCount: rowCount,
-		Meta:     meta,
-	}, nil
+	now := time.Now()
+	f.data = ndjson
+	f.entry = spool.Entry{
+		ID:        id,
+		URI:       spool.URIFor(id),
+		Path:      "/tmp/metabase-mcp/results/" + id + ".ndjson",
+		MIMEType:  spool.MIMEType,
+		Bytes:     int64(len(ndjson)),
+		RowCount:  rowCount,
+		CreatedAt: now,
+		ExpiresAt: now.Add(fakeSpoolTTL),
+		Meta:      meta,
+	}
+	return f.entry, nil
 }
 
+// ReadAll отдаёт ту же запись, что вернул Put, — как настоящий Store.
 func (f *fakeSpool) ReadAll(id string) ([]byte, spool.Entry, error) {
-	if f.data == nil || id != "0123456789abcdef" {
+	if f.data == nil || id != f.entry.ID {
 		return nil, spool.Entry{}, spool.ErrNotFound
 	}
-	return f.data, spool.Entry{
-		ID:       id,
-		URI:      spool.URIFor(id),
-		MIMEType: spool.MIMEType,
-		Bytes:    int64(len(f.data)),
-		RowCount: f.rows,
-		Meta:     f.meta,
-	}, nil
+	return f.data, f.entry, nil
 }
 
 // bigDataset — n строк с маркером в 50-й (индекс 49).
@@ -169,6 +169,9 @@ func TestExecuteSQL_FileMode_NoRowsInStructuredContent(t *testing.T) {
 	if link.Size == nil || *link.Size != out.Resource.Bytes {
 		t.Errorf("ResourceLink.Size = %v", link.Size)
 	}
+	if link.Title == "" || link.Annotations == nil {
+		t.Errorf("ResourceLink без title или annotations: %+v", link)
+	}
 	for _, c := range res.Content {
 		if tc, ok := c.(*mcp.TextContent); ok && strings.Contains(tc.Text, marker) {
 			t.Error("маркер попал в текстовый Content")
@@ -183,9 +186,36 @@ func TestExecuteSQL_FileMode_NoRowsInStructuredContent(t *testing.T) {
 		t.Error("маркер должен быть в файле")
 	}
 	// _meta ресурса несёт маппинг key↔name.
-	cols, _ := sp.meta["columns"].([]map[string]any)
+	cols, _ := sp.entry.Meta["columns"].([]map[string]any)
 	if len(cols) != 2 || cols[1]["key"] != "id_2" || cols[1]["name"] != "id" {
-		t.Errorf("_meta.columns = %#v", sp.meta["columns"])
+		t.Errorf("_meta.columns = %#v", sp.entry.Meta["columns"])
+	}
+}
+
+// TestResultLink — ссылка подписана как шаблон и помечена как данные для
+// модели с низким приоритетом: хост не должен ни показывать NDJSON
+// пользователю, ни тянуть его в контекст наравне с ответом tool'а.
+func TestResultLink(t *testing.T) {
+	// Зона не UTC: lastModified обязан уйти в UTC.
+	created := time.Date(2026, 1, 2, 15, 4, 5, 0, time.FixedZone("MSK", 3*60*60))
+	link := resultLink(spool.Entry{CreatedAt: created})
+
+	tpl := resultTemplate()
+	if link.Title == "" || link.Title != tpl.Title || link.Name != tpl.Name {
+		t.Errorf("name/title = %q/%q, у шаблона %q/%q", link.Name, link.Title, tpl.Name, tpl.Title)
+	}
+	a := link.Annotations
+	if a == nil {
+		t.Fatal("у ResourceLink нет annotations")
+	}
+	if len(a.Audience) != 1 || a.Audience[0] != "assistant" {
+		t.Errorf("audience = %v, want [assistant]", a.Audience)
+	}
+	if a.Priority <= 0 || a.Priority >= 0.5 {
+		t.Errorf("priority = %v: нужен низкий, но ненулевой (ноль съест omitempty)", a.Priority)
+	}
+	if want := "2026-01-02T12:04:05Z"; a.LastModified != want {
+		t.Errorf("lastModified = %q, want %q (RFC 3339, UTC)", a.LastModified, want)
 	}
 }
 
@@ -358,6 +388,12 @@ func TestResultResource_Read(t *testing.T) {
 	if c.Meta == nil || c.Meta["columns"] == nil {
 		t.Errorf("_meta должен нести columns: %#v", c.Meta)
 	}
+	if rr.CacheScope != "private" {
+		t.Errorf("cacheScope = %q, want private", rr.CacheScope)
+	}
+	if rr.TTLMs <= 0 || rr.TTLMs > int(fakeSpoolTTL.Milliseconds()) {
+		t.Errorf("ttlMs = %d, want (0, %d]", rr.TTLMs, fakeSpoolTTL.Milliseconds())
+	}
 
 	// Шаблон обязан быть виден в resources/templates/list.
 	lst, err := sess.ListResourceTemplates(context.Background(), nil)
@@ -365,7 +401,10 @@ func TestResultResource_Read(t *testing.T) {
 		t.Fatalf("ListResourceTemplates: %v", err)
 	}
 	if len(lst.ResourceTemplates) != 1 || lst.ResourceTemplates[0].URITemplate != spool.URITemplate {
-		t.Errorf("templates = %+v", lst.ResourceTemplates)
+		t.Fatalf("templates = %+v", lst.ResourceTemplates)
+	}
+	if lst.ResourceTemplates[0].Annotations == nil {
+		t.Error("у шаблона нет annotations")
 	}
 }
 

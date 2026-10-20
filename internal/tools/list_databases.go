@@ -21,6 +21,8 @@ type listDatabasesOut struct {
 	Databases []DatabaseInfo `json:"databases"`
 }
 
+const listDatabasesTitle = "List databases"
+
 const listDatabasesDesc = "Returns connected databases visible to this Metabase. " +
 	"Use this FIRST to learn which database_id corresponds to which logical source. " +
 	"Cached 5 minutes."
@@ -31,10 +33,7 @@ const databasesCacheKey = "all"
 
 func registerListDatabases(server *mcp.Server, d Deps) {
 	mcp.AddTool(server,
-		&mcp.Tool{
-			Name:        "list_databases",
-			Description: listDatabasesDesc,
-		},
+		readOnlyTool("list_databases", listDatabasesTitle, listDatabasesDesc),
 		func(ctx context.Context, _ *mcp.CallToolRequest, _ listDatabasesIn) (*mcp.CallToolResult, listDatabasesOut, error) {
 			dbs, err := fetchDatabases(ctx, d)
 			if err != nil {

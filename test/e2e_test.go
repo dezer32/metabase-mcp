@@ -159,6 +159,36 @@ func TestE2E_ListTables(t *testing.T) {
 	}
 }
 
+// TestE2E_ServerInfoAndToolAnnotations — карточка сервера и аннотации
+// tool'ов доходят до клиента реального бинаря. Значения хинтов сторожит
+// TestTools_ReadOnlyAnnotations.
+func TestE2E_ServerInfoAndToolAnnotations(t *testing.T) {
+	fake := NewFakeMetabase()
+	defer fake.Close()
+	sess := startClient(t, fake)
+
+	info := sess.InitializeResult().ServerInfo
+	if info == nil {
+		t.Fatal("serverInfo отсутствует")
+	}
+	if info.Title == "" || info.Description == "" || info.WebsiteURL == "" {
+		t.Errorf("serverInfo = %+v: title, description и websiteUrl должны быть заполнены", info)
+	}
+
+	res, err := sess.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if len(res.Tools) == 0 {
+		t.Fatal("tools/list пуст")
+	}
+	for _, tool := range res.Tools {
+		if tool.Annotations == nil {
+			t.Errorf("%s: annotations отсутствуют", tool.Name)
+		}
+	}
+}
+
 func TestE2E_ExecuteSQL_Success(t *testing.T) {
 	fake := NewFakeMetabase()
 	defer fake.Close()
@@ -427,6 +457,9 @@ func TestE2E_ExecuteSQL_SpoolsLargeResult(t *testing.T) {
 	if link.URI != out.Resource.URI {
 		t.Errorf("ResourceLink.URI = %q, want %q", link.URI, out.Resource.URI)
 	}
+	if link.Annotations == nil {
+		t.Error("у ResourceLink нет annotations")
+	}
 
 	// resources/read по этому URI отдаёт весь набор.
 	rr, err := sess.ReadResource(context.Background(),
@@ -445,6 +478,13 @@ func TestE2E_ExecuteSQL_SpoolsLargeResult(t *testing.T) {
 	}
 	if rr.Contents[0].Meta["columns"] == nil {
 		t.Errorf("_meta должен нести columns: %#v", rr.Contents[0].Meta)
+	}
+	if rr.CacheScope != "private" {
+		t.Errorf("cacheScope = %q, want private", rr.CacheScope)
+	}
+	// RESULT_SPOOL_TTL по умолчанию — 1h.
+	if rr.TTLMs <= 0 || rr.TTLMs > int(time.Hour.Milliseconds()) {
+		t.Errorf("ttlMs = %d, want (0, %d]", rr.TTLMs, time.Hour.Milliseconds())
 	}
 
 	// Битый URI — not found, а не путь наружу.

@@ -47,6 +47,10 @@ type Config struct {
 
 // Entry — метаданные одного спуленного результата.
 //
+// ExpiresAt — момент, после которого результат считается истёкшим:
+// CreatedAt + TTL. Единственный источник правды о сроке жизни — по нему
+// же tools-слой считает cache-хинт ресурса.
+//
 // Meta — произвольный JSON-объект, который вызывающий кладёт рядом с
 // файлом: спул его не интерпретирует, а tools-слой отдаёт наружу в
 // _meta ресурса. Без него standalone resources/read вернул бы NDJSON
@@ -59,6 +63,7 @@ type Entry struct {
 	Bytes     int64
 	RowCount  int
 	CreatedAt time.Time
+	ExpiresAt time.Time
 	Meta      map[string]any
 }
 
@@ -142,6 +147,7 @@ func (s *Store) Put(ndjson []byte, rowCount int, meta map[string]any) (Entry, er
 		return Entry{}, fmt.Errorf("spool: rename %s: %w", tmp, err)
 	}
 
+	now := s.now()
 	e := Entry{
 		ID:        id,
 		URI:       URIFor(id),
@@ -149,7 +155,8 @@ func (s *Store) Put(ndjson []byte, rowCount int, meta map[string]any) (Entry, er
 		MIMEType:  MIMEType,
 		Bytes:     int64(len(ndjson)),
 		RowCount:  rowCount,
-		CreatedAt: s.now(),
+		CreatedAt: now,
+		ExpiresAt: now.Add(s.ttl),
 		Meta:      meta,
 	}
 
@@ -255,7 +262,7 @@ func (s *Store) Close() error {
 
 // expired — вызывать под s.mu.
 func (s *Store) expired(e Entry) bool {
-	return s.now().Sub(e.CreatedAt) > s.ttl
+	return s.now().After(e.ExpiresAt)
 }
 
 // removeFiles удаляет файлы вне мьютекса: ошибку логируем, но наружу

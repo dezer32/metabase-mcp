@@ -22,6 +22,8 @@ Read-only MCP-сервер поверх REST-API Metabase. Даёт LLM-клие
 - `FOR UPDATE`, `LOCK IN SHARE MODE`;
 - Комментарий-обходчики типа `/* SELECT */ DROP TABLE x` (парсер видит AST, не строку).
 
+Кроме того, каждый tool объявляет MCP-аннотации `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true` и `openWorldHint: false`. Хосты, которые их учитывают, не спрашивают подтверждения, как для вызова, способного изменить данные.
+
 ### Пагинация
 
 **Пагинация живёт в самом SQL.** Аргументов `limit`/`offset` у tool'а нет: передавайте `LIMIT` и `OFFSET` в запросе и листайте страницы, увеличивая `OFFSET`.

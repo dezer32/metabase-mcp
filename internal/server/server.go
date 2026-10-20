@@ -18,10 +18,15 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// Implementation — версионная метка нашего сервера, видимая клиенту.
+// Implementation — карточка нашего сервера, видимая клиенту: версионная
+// метка плюс то, что хост показывает пользователю. Title отличает нас от
+// официального Metabase-коннектора.
 var Implementation = &mcp.Implementation{
-	Name:    "metabase-mcp",
-	Version: "0.1.0",
+	Name:        "metabase-mcp",
+	Title:       "Metabase (read-only)",
+	Description: "Read-only access to Metabase: list databases and tables, run SELECT queries.",
+	Version:     "0.1.0",
+	WebsiteURL:  "https://github.com/dezer32/metabase-mcp",
 }
 
 // cacheTTL применяется ко всем кэшам tools-слоя.
@@ -80,8 +85,7 @@ func New(ctx context.Context, cfg config.Config, transport string, log *slog.Log
 	}
 
 	srv := mcp.NewServer(Implementation, nil)
-	// Register обязан быть до Run: capability resources сервер вычисляет
-	// один раз на initialize по наличию шаблона ресурса.
+	// Register — строго до Run, см. tools.Register.
 	tools.Register(srv, deps)
 	return &Instance{MCP: srv, spool: st}, nil
 }

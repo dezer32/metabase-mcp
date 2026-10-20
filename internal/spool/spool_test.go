@@ -62,6 +62,9 @@ func TestPutGetReadAll(t *testing.T) {
 	if e.URI != URIFor(e.ID) || e.MIMEType != MIMEType {
 		t.Errorf("Entry URI/MIME: %+v", e)
 	}
+	if want := e.CreatedAt.Add(defaultTTL); !e.ExpiresAt.Equal(want) {
+		t.Errorf("ExpiresAt = %v, want CreatedAt+TTL = %v", e.ExpiresAt, want)
+	}
 
 	got, ge, err := s.ReadAll(e.ID)
 	if err != nil {
@@ -70,7 +73,7 @@ func TestPutGetReadAll(t *testing.T) {
 	if string(got) != string(data) {
 		t.Errorf("ReadAll вернул %q, want %q", got, data)
 	}
-	if ge.ID != e.ID {
+	if ge.ID != e.ID || !ge.ExpiresAt.Equal(e.ExpiresAt) {
 		t.Errorf("Entry из ReadAll: %+v", ge)
 	}
 

@@ -17,16 +17,15 @@ type listTablesOut struct {
 	Tables []schema.Table `json:"tables"`
 }
 
+const listTablesTitle = "List tables"
+
 const listTablesDesc = "Returns schema of one database: tables, columns with types, and foreign keys. " +
 	"Use this before writing SQL. Engine is reported by list_databases — adjust SQL dialect to it. " +
 	"Cached 5 minutes per database_id."
 
 func registerListTables(server *mcp.Server, d Deps) {
 	mcp.AddTool(server,
-		&mcp.Tool{
-			Name:        "list_tables",
-			Description: listTablesDesc,
-		},
+		readOnlyTool("list_tables", listTablesTitle, listTablesDesc),
 		func(ctx context.Context, _ *mcp.CallToolRequest, in listTablesIn) (*mcp.CallToolResult, listTablesOut, error) {
 			if in.DatabaseID <= 0 {
 				return nil, listTablesOut{}, fmt.Errorf("list_tables: database_id must be positive (got %d)", in.DatabaseID)

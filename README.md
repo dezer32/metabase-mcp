@@ -22,6 +22,8 @@ Read-only MCP server on top of the Metabase REST API. Gives an LLM client (Claud
 - `FOR UPDATE`, `LOCK IN SHARE MODE`;
 - Comment-based bypasses like `/* SELECT */ DROP TABLE x` (the parser sees the AST, not the raw string).
 
+Every tool also declares the MCP annotations `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true` and `openWorldHint: false`, so hosts that respect them don't ask for confirmation as they would for a call that could change data.
+
 ### Pagination
 
 **Pagination lives in the SQL itself.** There are no `limit`/`offset` tool arguments: pass `LIMIT` and `OFFSET` in the query and walk pages by raising `OFFSET`.
